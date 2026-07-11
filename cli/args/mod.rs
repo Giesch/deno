@@ -1206,11 +1206,17 @@ impl CliOptions {
     dir: &WorkspaceDirectory,
   ) -> Result<PermissionsOptions, AnyError> {
     let config_permissions = self.resolve_config_permissions_for_dir(dir)?;
+    let has_config_permissions = config_permissions.is_some();
     let mut permissions_options = flags_to_permissions_options(
       &self.flags.permissions,
       config_permissions,
     )?;
     self.augment_import_permissions(&mut permissions_options);
+    self.maybe_apply_relaxed_default_permissions(
+      &mut permissions_options,
+      has_config_permissions,
+    );
+    self.apply_always_on_env_vars(&mut permissions_options);
     if let DenoSubcommand::Serve(serve_flags) = &self.flags.subcommand {
       augment_permissions_with_serve_flags(
         &mut permissions_options,
@@ -1317,6 +1323,138 @@ impl CliOptions {
       }
       imports
     }
+  }
+
+  /// Applies the unstable relaxed default permission profile to the computed
+  /// permission options when the gate is on and the user provided no explicit
+  /// allow-side permission configuration.
+  ///
+  /// This is groundwork for the Deno 3 default-permissions change: instead of
+  /// denying every capability and prompting one by one, the profile grants a
+  /// pragmatic baseline that lets most CLI tools run without prompts while
+  /// still blocking exfiltration (net stays gated) and persistence outside the
+  /// project (write is confined to the cwd and the OS temp directory):
+  ///
+  /// - read: allowed everywhere on disk
+  /// - write: allowed only under the cwd (at process start) and the OS temp dir
+  /// - env: allowed
+  /// - net, run, ffi, sys: unchanged (still prompt in a TTY, deny
+  ///   non-interactively)
+  /// - import: unchanged (keeps its existing implicit trusted-host allowance)
+  ///
+  /// `--deny-*` flags do not disable the profile; they compose on top since
+  /// deny always wins.
+  /// Whether the current subcommand executes user code with the prompt-based
+  /// permission defaults. `deno eval` and `deno x` already imply allow-all, and
+  /// `deno compile` bakes permissions at compile time (out of scope).
+  fn runs_user_code_with_prompt_defaults(&self) -> bool {
+    matches!(
+      self.flags.subcommand,
+      DenoSubcommand::Run(_)
+        | DenoSubcommand::Serve(_)
+        | DenoSubcommand::Test(_)
+        | DenoSubcommand::Bench(_)
+        | DenoSubcommand::Task(_)
+        | DenoSubcommand::Repl(_)
+    )
+  }
+
+  /// Folds the always-on env variables (`ALWAYS_ON_ENV_VARS`) into the computed
+  /// `allow_env` descriptors so they remain readable without a prompt in every
+  /// profile, including the strict default. This replaces the historical
+  /// unconditional `skip_permission_check` bypass in `op_get_env`: because the
+  /// read now goes through the permission path, `--deny-env` wins over these
+  /// grants, which the bypass did not allow.
+  ///
+  /// Applied regardless of the relaxed-permissions gate. It composes on top of
+  /// whatever `allow_env` the flags, config or relaxed profile produced, and
+  /// preserves the "allow all" meaning of an empty `allow_env` list.
+  fn apply_always_on_env_vars(&self, options: &mut PermissionsOptions) {
+    if !self.runs_user_code_with_prompt_defaults() {
+      return;
+    }
+    merge_default_allow_env(&mut options.allow_env, ALWAYS_ON_ENV_VARS);
+  }
+
+  /// Whether the unstable relaxed default permission profile applies given the
+  /// gating inputs. The profile only applies to subcommands that run user code
+  /// with the prompt-based defaults, when the unstable gate is on, and when no
+  /// explicit allow-side configuration (--allow-*, -A, -P, or a config-file
+  /// permission set) was provided. `--deny-*` flags are intentionally not
+  /// consulted so they compose on top of the profile.
+  fn relaxed_default_profile_applies(
+    &self,
+    has_config_permissions: bool,
+  ) -> bool {
+    self.runs_user_code_with_prompt_defaults()
+      && relaxed_default_permissions_enabled()
+      && !self.flags.permissions.has_allow_permission()
+      && self.flags.permission_set.is_none()
+      && !has_config_permissions
+  }
+
+  /// Whether the relaxed default permission profile was applied to this
+  /// invocation. Mirrors `maybe_apply_relaxed_default_permissions` so callers
+  /// outside permission construction (for example the worker factory widening
+  /// read to this program's resolved npm package folders) can act only when the
+  /// profile is active. Must stay in sync via `relaxed_default_profile_applies`.
+  pub fn relaxed_default_permissions_applied(&self) -> bool {
+    let has_config_permissions = self
+      .resolve_config_permissions_for_dir(&self.start_dir)
+      .ok()
+      .flatten()
+      .is_some();
+    self.relaxed_default_profile_applies(has_config_permissions)
+  }
+
+  fn maybe_apply_relaxed_default_permissions(
+    &self,
+    options: &mut PermissionsOptions,
+    has_config_permissions: bool,
+  ) {
+    if !self.relaxed_default_profile_applies(has_config_permissions) {
+      return;
+    }
+
+    // TODO(deno3): consider also exposing this profile as a reserved built-in
+    // permission set name (e.g. `-P standard`) so it can be selected explicitly
+    // even with the gate off. Skipped here to keep the central default minimal.
+    log::debug!("Applying unstable relaxed default permission profile.");
+
+    // read: confined to the cwd (recorded at process start) and the OS temp
+    // directory, mirroring the write confinement below. A non-empty allow-list
+    // means reads outside these prefixes still prompt in a TTY and deny
+    // non-interactively, instead of the previous "allow all" behavior.
+    options.allow_read =
+      Some(relaxed_default_read_write_paths(self.initial_cwd()));
+    // env: allowed for the curated default-readable allowlist (see #35950).
+    // This is a deny-respecting allow-list (not an allow-all bypass), so
+    // credential-shaped variables still prompt and `--deny-env` still wins.
+    options.allow_env = Some(
+      RELAXED_DEFAULT_ENV_ALLOWLIST
+        .iter()
+        .map(|name| name.to_string())
+        .collect(),
+    );
+    // write: confined to the cwd (recorded at process start) and the OS temp
+    // directory.
+    options.allow_write =
+      Some(relaxed_default_read_write_paths(self.initial_cwd()));
+    // write deny: the `.git` directory inside the cwd stays non-writable even
+    // though the rest of the cwd is writable. This blocks planting a
+    // `.git/hooks/pre-commit` (or similar) that would execute on the next git
+    // invocation. Deny always wins over the cwd write-allow above. Merge into
+    // any user-provided `--deny-write` rather than overwriting it, so an
+    // explicit `--deny-write` still composes (deny always wins).
+    let git_deny_write =
+      relaxed_default_git_deny_write_paths(self.initial_cwd());
+    match &mut options.deny_write {
+      Some(existing) => existing.extend(git_deny_write),
+      None => options.deny_write = Some(git_deny_write),
+    }
+    // net, run, ffi and sys are intentionally left untouched so they keep
+    // prompting in a TTY and denying non-interactively. import keeps its
+    // existing implicit trusted-host allowance from augment_import_permissions.
   }
 
   fn get_cli_arg_urls(&self) -> Vec<Cow<'_, Url>> {
@@ -1700,6 +1838,224 @@ fn allow_import_host_from_url(url: &Url) -> Option<String> {
       "https" => Some(format!("{}:443", host)),
       "http" => Some(format!("{}:80", host)),
       _ => None,
+    }
+  }
+}
+
+/// Env var gating the unstable relaxed default permission profile. Groundwork
+/// for the Deno 3 default-permissions change: the profile is on by default and
+/// setting the var to `0` opts back out to today's deny-by-default behavior.
+const RELAXED_PERMISSIONS_ENV_VAR: &str = "DENO_UNSTABLE_RELAXED_PERMISSIONS";
+
+fn relaxed_default_permissions_enabled() -> bool {
+  match std::env::var(RELAXED_PERMISSIONS_ENV_VAR) {
+    // On by default; only an explicit `0` disables it.
+    Ok(value) => value != "0",
+    Err(_) => true,
+  }
+}
+
+/// Appends `path` and, when it resolves, its canonicalized form to `paths`,
+/// skipping duplicates. Both forms are recorded so that permission descriptors
+/// match regardless of symlinked prefixes (for example macOS's `/tmp` ->
+/// `/private/tmp` and `/var/folders` temp dirs, which are canonicalized at
+/// permission-check time).
+fn push_path_with_canonicalized(paths: &mut Vec<PathBuf>, path: PathBuf) {
+  if !paths.contains(&path) {
+    paths.push(path.clone());
+  }
+  if let Ok(canonical) = crate::util::fs::canonicalize_path(&path)
+    && !paths.contains(&canonical)
+  {
+    paths.push(canonical);
+  }
+}
+
+/// The read/write allow-list for the relaxed default profile: the process-start
+/// cwd and the OS temp directory. Both read and write are confined to these
+/// same prefixes. Each entry contributes its raw and canonicalized form (see
+/// `push_path_with_canonicalized`). The OS temp directory honors the `TMPDIR`
+/// env var via `std::env::temp_dir`.
+fn relaxed_default_read_write_paths(initial_cwd: &Path) -> Vec<String> {
+  let mut paths: Vec<PathBuf> = Vec::with_capacity(4);
+  push_path_with_canonicalized(&mut paths, initial_cwd.to_path_buf());
+  push_path_with_canonicalized(&mut paths, std::env::temp_dir());
+  paths
+    .into_iter()
+    .map(|path| path.to_string_lossy().into_owned())
+    .collect()
+}
+
+/// The write deny-list for the relaxed default profile: the `.git` directory
+/// inside the process-start cwd. This keeps the writable cwd from being used to
+/// plant a `.git/hooks/pre-commit` (or similar) that runs on the next git
+/// invocation. Both the raw and canonicalized forms of the cwd are recorded so
+/// the deny matches whether the write path is expressed relative to the raw or
+/// the canonicalized cwd. Note this is a lexical deny: like `--deny-write=.git`,
+/// it does not defend against a symlink inside the cwd that points at `.git`,
+/// because write permission checks are not symlink-canonicalized.
+fn relaxed_default_git_deny_write_paths(initial_cwd: &Path) -> Vec<String> {
+  let mut paths: Vec<PathBuf> = Vec::with_capacity(2);
+  push_path_with_canonicalized(&mut paths, initial_cwd.join(".git"));
+  paths
+    .into_iter()
+    .map(|path| path.to_string_lossy().into_owned())
+    .collect()
+}
+
+/// Environment variables that Deno reads without an env permission prompt in
+/// every profile, including the strict default. These are the four Node compat
+/// variables that were historically read via an unconditional
+/// `skip_permission_check` bypass in `op_get_env` (see #15890). They are folded
+/// into the default `allow_env` descriptors here so that reads still go through
+/// the permission path and therefore honor `--deny-env` (deny always wins),
+/// while user code and the Node polyfills keep reading them without a prompt.
+///
+/// Every entry here is also part of `RELAXED_DEFAULT_ENV_ALLOWLIST`.
+const ALWAYS_ON_ENV_VARS: [&str; 4] =
+  ["FORCE_COLOR", "NODE_DEBUG", "NODE_OPTIONS", "NO_COLOR"];
+
+/// The curated default-readable environment variable allowlist applied by the
+/// relaxed default permission profile. These names are structurally
+/// non-sensitive (terminal/color, locale, standard directory paths, CI
+/// detection, common Node/runtime knobs, and the `npm_*` variables that
+/// `deno task` itself sets), so ordinary CLI tools run without env prompts
+/// while every credential-shaped variable still prompts exactly as before.
+///
+/// A trailing `*` denotes a prefix pattern (handled by `EnvDescriptor::new`).
+/// Wildcards are used only where an entire namespace is structurally
+/// non-secret. Namespaces that carry credentials, such as `npm_config_*`,
+/// `GITHUB_*`, `AWS_*` and `DENO_*`, are never wildcarded.
+///
+/// This list is intentionally curated and baked into the binary; see #35950.
+/// It must stay a superset of `ALWAYS_ON_ENV_VARS`.
+const RELAXED_DEFAULT_ENV_ALLOWLIST: &[&str] = &[
+  // Terminal / color / TTY.
+  "TERM",
+  "COLORTERM",
+  "TERM_PROGRAM",
+  "TERM_PROGRAM_VERSION",
+  "TERMINFO",
+  "COLUMNS",
+  "LINES",
+  "NO_COLOR",
+  "FORCE_COLOR",
+  "CLICOLOR",
+  "CLICOLOR_FORCE",
+  // Locale / timezone.
+  "LANG",
+  "LANGUAGE",
+  "LC_*",
+  "TZ",
+  // Shell / identity / cwd. `_` is the shell-provided path of the running
+  // executable (argv0), read by many Node CLIs such as yargs.
+  "SHELL",
+  "USER",
+  "LOGNAME",
+  "USERNAME",
+  "HOME",
+  "USERPROFILE",
+  "PWD",
+  "OLDPWD",
+  "_",
+  // Paths / XDG / Windows dirs.
+  "PATH",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "XDG_*",
+  "APPDATA",
+  "LOCALAPPDATA",
+  "PROGRAMDATA",
+  "PROGRAMFILES",
+  "HOMEDRIVE",
+  "HOMEPATH",
+  "SYSTEMROOT",
+  "WINDIR",
+  "PATHEXT",
+  "COMSPEC",
+  // OS / platform.
+  "OS",
+  "OSTYPE",
+  "HOSTTYPE",
+  "MACHTYPE",
+  "PROCESSOR_ARCHITECTURE",
+  // Node / runtime knobs.
+  "NODE_ENV",
+  "NODE_OPTIONS",
+  "NODE_PATH",
+  "NODE_DEBUG",
+  "NODE_NO_WARNINGS",
+  "NODE_DISABLE_COLORS",
+  "NODE_PENDING_DEPRECATION",
+  "NODE_ICU_DATA",
+  "NODE_EXTRA_CA_CERTS",
+  "NO_UPDATE_NOTIFIER",
+  // `deno task` npm_* vars (exactly what `deno task` sets; refs #35251,
+  // #35306).
+  "npm_package_name",
+  "npm_package_version",
+  "npm_package_json",
+  "npm_package_config_*",
+  "npm_execpath",
+  "npm_node_execpath",
+  "npm_command",
+  "npm_lifecycle_event",
+  "npm_lifecycle_script",
+  "npm_config_user_agent",
+  "INIT_CWD",
+  // Debug conventions.
+  "DEBUG",
+  "DEBUG_*",
+  // Editor / pager.
+  "EDITOR",
+  "VISUAL",
+  "PAGER",
+  "MANPAGER",
+  "GIT_PAGER",
+  "BROWSER",
+  // CI detection (boolean/name flags read by `ci-info` and friends; the
+  // enumerated set never includes CI secret tokens).
+  "CI",
+  "CONTINUOUS_INTEGRATION",
+  "BUILD_NUMBER",
+  "CI_NAME",
+  "GITHUB_ACTIONS",
+  "GITLAB_CI",
+  "CIRCLECI",
+  "TRAVIS",
+  "APPVEYOR",
+  "JENKINS_URL",
+  "TEAMCITY_VERSION",
+  "BUILDKITE",
+  "DRONE",
+  "TF_BUILD",
+  "NETLIFY",
+  "VERCEL",
+  "CODEBUILD_BUILD_ID",
+];
+
+/// Merges `additions` into `allow_env`, preserving the "allow all" meaning of an
+/// empty allow-list. When `allow_env` is `None` it becomes a fresh list of the
+/// additions; when it is a non-empty list the additions are appended (skipping
+/// duplicates); when it is `Some` but empty (allow all) it is left untouched.
+fn merge_default_allow_env(
+  allow_env: &mut Option<Vec<String>>,
+  additions: impl IntoIterator<Item = &'static str>,
+) {
+  match allow_env {
+    None => {
+      *allow_env = Some(additions.into_iter().map(|s| s.to_string()).collect());
+    }
+    Some(list) if list.is_empty() => {
+      // Empty list means "allow all"; adding names would narrow it. Leave it.
+    }
+    Some(list) => {
+      for addition in additions {
+        if !list.iter().any(|existing| existing == addition) {
+          list.push(addition.to_string());
+        }
+      }
     }
   }
 }

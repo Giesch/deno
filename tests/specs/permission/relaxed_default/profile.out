@@ -1,0 +1,7 @@
+read cwd: ok
+read temp: ok
+read outside: NotCapable --allow-read
+write cwd: ok
+write temp: ok
+write outside: NotCapable --allow-write
+env: hello
